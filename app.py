@@ -1,7 +1,7 @@
 from flask import Flask, render_template, request, redirect, url_for, session, flash, g
 from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
-import collections
+from collections import Counter
 import json
 import sqlite3
 import hashlib
@@ -934,6 +934,55 @@ def moderate_content(content):
 
     moderated_content = content
     score = 0
+
+    # Rule 1.1.1 (Tier 1 Words)    
+    patternTier1 = r'\b(' + '|'.join(TIER1_WORDS) + r')\b'
+    matchesTier1 = re.findall(patternTier1, moderated_content, flags=re.IGNORECASE)
+    if len(matchesTier1) > 0:
+        moderated_content = "[content removed due to severe violation]"
+        score = 5
+        return moderated_content, score
+    
+    # Rule 1.1.2 (Tier 2 Phrases)
+    patternTier2 = r'\b(' + '|'.join(TIER2_PHRASES) + r')\b'
+    matchesTier2 = re.findall(patternTier2, moderated_content, flags=re.IGNORECASE)
+    if len(matchesTier2) > 0:
+        moderated_content = "[content removed due to spam/scam policy]"
+        score = 5
+        return moderated_content, score
+    
+    # Rule 1.2.1 (Tier 3 Words)
+    patternTier3 = r'\b(' + '|'.join(TIER3_WORDS) + r')\b'
+    # Run the regex to find all the matching words
+    matchesTier3 = re.findall(patternTier3, moderated_content, flags=re.IGNORECASE)
+    # 2 points for each match as per rule 1.2.1
+    score = len(matchesTier3) * 2
+    # Using the same regex, we replace all words with *
+    moderated_content = re.sub(patternTier3, lambda m: '*' * len(m.group(0)), moderated_content, flags=re.IGNORECASE)
+
+    # Rule 1.2.2 (External Links)
+    patternUrl = r'(https?://[^\s]+|www\.[^\s]+|[^\s]+\.com|[^\s]+\.net|[^\s]+\.org|[^\s]+\.store|[^\s]+\.io|[^\s]+\/[^\s]+|[^\s]+\[\.\][^\s]+)'
+    matchesUrlStart = re.findall(patternUrl, content, flags=re.IGNORECASE)
+    if len(matchesUrlStart) > 0:
+        score += len(matchesUrlStart) * 2
+        moderated_content = re.sub(patternUrl, "[link removed]", moderated_content, flags=re.IGNORECASE)
+
+    # Rule 1.2.3 (Excessive Capitalization)
+    letters = [c for c in content if c.isalpha()]
+    if len(letters) > 15:
+        upperCaseRatio = (len([c for c in letters if c.isupper()]) / len(letters))
+        if upperCaseRatio > 0.7:
+            score += 0.5
+
+    # Rule 1.2.4 (Money mentioned), my own addition   
+    patternMoney = r'(\$\d+|\€\d+|\£\d+|\d+\s?USD|\d+\s?EUR)'
+    matchesMoney = re.findall(patternMoney, content, flags=re.IGNORECASE)
+    patternWordMoney = r'\b(cash|money|credit)\b'
+    wordMatchesMoney = re.findall(patternWordMoney, content, flags=re.IGNORECASE)
+    if len(matchesMoney) > 0:
+        score += len(matchesMoney) * 2
+    if len(wordMatchesMoney) > 0:
+        score += len(wordMatchesMoney) * 1
     
     return moderated_content, score
 
