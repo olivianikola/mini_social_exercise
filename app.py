@@ -890,9 +890,71 @@ def recommend(user_id, filter_following):
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
 
-    recommended_posts = {} 
+    """
+    Recommendation Algorithm: Implement the recommend function. Identify a suitable, simple recommendation algorithm 
+    that will recommend 5 relevant posts on the “Recommended” tab based on the posts the user reacted to positively 
+    and the users they followed.
+    """
+    positive_reactions = ('like', 'love', 'haha', 'wow')
+    # 1. Get the content of all posts the user has positively reacted to
+    liked_posts_content = query_db('''
+        SELECT p.content FROM posts p
+        JOIN reactions r ON p.id = r.post_id
+        WHERE r.user_id = ? AND r.reaction_type IN ({})
+    ''', (user_id,positive_reactions))
 
-    return recommended_posts;
+    # If the user hasn't liked any posts return the 5 newest posts
+    if not liked_posts_content:
+        if filter_following:
+            return query_db('''
+                SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+                FROM posts p JOIN users u ON p.user_id = u.id
+                WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)
+                AND p.user_id != ? ORDER BY p.created_at DESC LIMIT 5
+            ''', (user_id,))
+        return query_db('''
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            FROM posts p JOIN users u ON p.user_id = u.id
+            WHERE p.user_id != ? ORDER BY p.created_at DESC LIMIT 5
+        ''', (user_id,))
+
+    # 2. Find the most common words from the posts they liked
+    word_counts = Counter()
+    # A simple list of common words to ignore
+    stop_words = {'a', 'an', 'the', 'in', 'on', 'is', 'it', 'to', 'for', 'of', 'and', 'with'}
+    
+    for post in liked_posts_content:
+        # Use regex to find all words in the post content
+        words = re.findall(r'\b\w+\b', post['content'].lower())
+        for word in words:
+            if word not in stop_words and len(word) > 2:
+                word_counts[word] += 1
+    
+    top_keywords = [word for word, _ in word_counts.most_common(10)]
+
+    query = "SELECT p.id, p.content, p.created_at, u.username, u.id as user_id FROM posts p JOIN users u ON p.user_id = u.id"
+    params = []
+    
+    # If filtering by following, add a WHERE clause to only include followed users.
+    if filter_following:
+        query += " WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
+        params.append(user_id)
+        
+    all_other_posts = query_db(query, tuple(params))
+    
+    recommended_posts = []
+    liked_post_ids = {post['id'] for post in query_db('SELECT post_id as id FROM reactions WHERE user_id = ? AND ({})', (user_id, positive_reactions))}
+
+    for post in all_other_posts:
+        if post['id'] in liked_post_ids or post['user_id'] == user_id:
+            continue
+        
+        if any(keyword in post['content'].lower() for keyword in top_keywords):
+            recommended_posts.append(post)
+
+    recommended_posts.sort(key=lambda p: p['created_at'], reverse=True)
+
+    return recommended_posts[:5];
 
 # Task 3.2
 def user_risk_analysis(user_id):
@@ -908,12 +970,69 @@ def user_risk_analysis(user_id):
             password: admin
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
-    
     score = 0
+
+    # Step 1: Calculate the base_score for the content using the Content Moderation Function.
+    # Step 2: Determine the author's account age in days.
+    # Step 3: Apply an age-based multiplier to the base_score to get the final risk_score:
+    # If account age is less than 7 days, risk_score = base_score * 1.5.
+    # Otherwise, risk_score = base_score.
+
+    user_profile = query_db('SELECT * FROM users WHERE id = ?', (user_id,))
+    if not user_profile:
+        return 0
+    
+    accountCreated = user_profile[0]['created_at']
+    accountAgeDays = (datetime.utcnow() - accountCreated).days
+    
+    # Step 1 (Profile Score): Calculate the Content Score of the user's profile text. This is the profile_score.
+    profile_text = user_profile[0]['profile'] or ''
+    _, profile_score = moderate_content(profile_text)
+
+    # Step 2 (Post Score): Calculate the Content Score for all of the user's posts and find the average. This is the average_post_score. If the user has no posts, this value is 0.
+    user_posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+    post_risk_score = []
+    for post in user_posts:
+        _, base_score = moderate_content(post['content'])
+        post_risk_score.append(base_score)
+    average_post_score = sum(post_risk_score) / len(post_risk_score) if post_risk_score else 0
+
+    # Step 3 (Comment Score): Calculate the Content Score for all of the user's comments and find the average. This is the average_comment_score. If the user has no comments, this value is 0.
+    user_comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+    comment_risk_score = []
+    for comment in user_comments:
+        _, base_score = moderate_content(comment['content'])
+        comment_risk_score.append(base_score)
+    average_comment_score = sum(comment_risk_score) / len(comment_risk_score) if comment_risk_score else 0
+
+    # Step 4 (Combine Scores): A preliminary content_risk_score is calculated using the following formula:
+    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
+    
+    # Step 5 (Apply Age Multiplier): The final user_risk_score is determined by applying a multiplier to the content_risk_score based on account age:
+    # If account age < 7 days: user_risk_score = content_risk_score * 1.5
+    # If account age < 30 days: user_risk_score = content_risk_score * 1.2
+    # Otherwise: user_risk_score = content_risk_score
+    if accountAgeDays < 7:
+        user_risk_score = content_risk_score * 1.5
+    elif accountAgeDays < 30:
+        user_risk_score = content_risk_score * 1.2
+    else:
+        user_risk_score = content_risk_score
+
+    # extra step, frequency of posts/comments
+    if accountAgeDays == 0:
+        accountAgeDays = 1
+    post_activity = len(user_posts) / accountAgeDays
+    comment_activity = len(user_comments) / accountAgeDays
+    if post_activity > 5 or comment_activity > 15:
+        user_risk_score *= 1.3
+
+
+    # Step 6 (Final Capping): The final calculated user_risk_score is capped at a maximum value of 5.0.
+    score = min(5.0, user_risk_score)
 
     return score;
 
-    
 # Task 3.3
 def moderate_content(content):
     """
