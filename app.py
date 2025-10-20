@@ -896,22 +896,29 @@ def recommend(user_id, filter_following):
     and the users they followed.
     """
     positive_reactions = ('like', 'love', 'haha', 'wow')
+    reactions = ','.join('?' * len(positive_reactions))
     # 1. Get the content of all posts the user has positively reacted to
-    liked_posts_content = query_db('''
+    reacted_posts_content = query_db('''
         SELECT p.content FROM posts p
         JOIN reactions r ON p.id = r.post_id
-        WHERE r.user_id = ? AND r.reaction_type IN ({})
-    ''', (user_id,positive_reactions))
+        WHERE r.user_id = ? AND r.reaction_type IN ({reactions})
+    ''', (user_id, *positive_reactions))
 
+    user_follow = query_db('''
+        SELECT followed_id FROM follows WHERE follower_id = ?
+    ''', (user_id,))
+    followed_user_ids = {f['followed_id'] for f in user_follow}
     # If the user hasn't liked any posts return the 5 newest posts
-    if not liked_posts_content:
-        if filter_following:
+    if not reacted_posts_content:
+        if filter_following and followed_user_ids:
             return query_db('''
                 SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
                 FROM posts p JOIN users u ON p.user_id = u.id
-                WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)
+                WHERE p.user_id IN (
+                    SELECT followed_id FROM follows WHERE follower_id = ?
+                )
                 AND p.user_id != ? ORDER BY p.created_at DESC LIMIT 5
-            ''', (user_id,))
+            ''', (*followed_user_ids,user_id))
         return query_db('''
             SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
             FROM posts p JOIN users u ON p.user_id = u.id
@@ -923,7 +930,7 @@ def recommend(user_id, filter_following):
     # A simple list of common words to ignore
     stop_words = {'a', 'an', 'the', 'in', 'on', 'is', 'it', 'to', 'for', 'of', 'and', 'with'}
     
-    for post in liked_posts_content:
+    for post in reacted_posts_content:
         # Use regex to find all words in the post content
         words = re.findall(r'\b\w+\b', post['content'].lower())
         for word in words:
@@ -932,18 +939,18 @@ def recommend(user_id, filter_following):
     
     top_keywords = [word for word, _ in word_counts.most_common(10)]
 
-    query = "SELECT p.id, p.content, p.created_at, u.username, u.id as user_id FROM posts p JOIN users u ON p.user_id = u.id"
+    query = "SELECT p.id, p.content, p.created_at, u.username, u.id as user_id FROM posts p JOIN users u ON p.user_id = u.id WHERE p.user_id != ?"
     params = []
     
     # If filtering by following, add a WHERE clause to only include followed users.
     if filter_following:
-        query += " WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
+        query += " AND p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
         params.append(user_id)
         
     all_other_posts = query_db(query, tuple(params))
     
     recommended_posts = []
-    liked_post_ids = {post['id'] for post in query_db('SELECT post_id as id FROM reactions WHERE user_id = ? AND ({})', (user_id, positive_reactions))}
+    liked_post_ids = {post['id'] for post in query_db('SELECT post_id as id FROM reactions WHERE user_id = ? AND ({reactions})', (user_id, *positive_reactions))}
 
     for post in all_other_posts:
         if post['id'] in liked_post_ids or post['user_id'] == user_id:
@@ -953,8 +960,9 @@ def recommend(user_id, filter_following):
             recommended_posts.append(post)
 
     recommended_posts.sort(key=lambda p: p['created_at'], reverse=True)
+    recommended_posts_ready = recommended_posts[:5]
 
-    return recommended_posts[:5];
+    return recommended_posts_ready;
 
 # Task 3.2
 def user_risk_analysis(user_id):
