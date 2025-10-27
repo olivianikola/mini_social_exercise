@@ -7,6 +7,9 @@ import sqlite3
 import hashlib
 import re
 from datetime import datetime
+import pandas as pd
+import nltk
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 app = Flask(__name__)
 app.secret_key = '123456789' 
@@ -138,6 +141,12 @@ def feed():
         posts = query_db(query, final_params)
     elif sort == 'recommended':
         posts = recommend(current_user_id, show == 'following' and current_user_id)
+    # New tab for page
+    elif sort == 'top20users':
+        users = top20users(current_user_id)
+        current_user_query = query_db('SELECT id, username FROM users WHERE id = ?', (current_user_id,), one=True)
+        users_shape = [{'username': u['username']} for u in users]
+        return render_template('user_list.html.j2', user=current_user_query, users=users_shape, title="Top20 users with good reputation")
     else:  # Default sort is 'new'
         query = f"""
             SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
@@ -868,6 +877,66 @@ def loop_color(user_id):
 
 
 # ----- Functions to be implemented are below
+
+def top20users(user_id):
+    """
+    Args:
+        user_id: The ID of the current user.
+
+    Returns:
+        A list of the top 20 users with the most positive content,
+        excluding users with high risk scores and the current user.
+    """
+    # Download the VADER lexicon
+    nltk.download('vader_lexicon')
+
+    # Load data
+    DB_FILE = "database.sqlite"
+
+    conn = sqlite3.connect(DB_FILE)
+
+    df = pd.read_sql_query("""
+    SELECT
+        p.user_id, u.username, p.content AS data FROM posts p
+    JOIN users u ON p.user_id = u.id
+    WHERE content IS NOT NULL
+    UNION ALL
+    SELECT
+        c.user_id, u.username, c.content AS data FROM comments c
+    JOIN users u ON c.user_id = u.id
+    WHERE content IS NOT NULL
+    """, conn)
+
+    if df.empty:
+        return []
+    # Initialize the VADER sentiment analyser
+    sia = SentimentIntensityAnalyzer()
+
+    # Calculate sentiment scores for each content
+    df['sentiment_score'] = df['data'].apply(lambda text: sia.polarity_scores(text)['compound'])
+
+    #Calculate both the count and mean sentiment for each content type
+    user_sentiment = df.groupby(['user_id', 'username'])['sentiment_score'].mean().reset_index()
+
+    # Take user risk into account
+    scores_to_top = []
+    for _, row in user_sentiment.iterrows():
+        if user_id == row['user_id']:
+            continue
+        user_risk = user_risk_analysis(row['user_id'])
+        if user_risk > 3.0:
+            continue
+        new_score = row['sentiment_score'] / (1 + user_risk)
+        scores_to_top.append((row['user_id'], row['username'], new_score))
+    
+    if not scores_to_top:
+        return []
+    # Sort users by adjusted sentiment score in descending order
+    scores_to_top.sort(key=lambda x: x[2], reverse=True)
+    top_20_users = scores_to_top[:20]
+    
+    return [{'user_id': user_id, 'username': username} for user_id, username, _ in top_20_users]
+
 
 # Task 3.1
 def recommend(user_id, filter_following):
